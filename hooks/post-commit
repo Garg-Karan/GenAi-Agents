@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# .git/hooks/post-commit  (installed by hooks/install.sh)
+#
+# Runs the Spring Boot test-generation agent against the latest commit.
+# Detaches into the background so `git commit` returns immediately,
+# but the orchestrator itself enforces the 20-min kill switch.
+
+set -u
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+AGENT_DIR="${SPRING_TEST_AGENT_DIR:-$REPO_ROOT/.test-agent}"
+LOG_DIR="$REPO_ROOT/.test-agent/logs"
+mkdir -p "$LOG_DIR"
+
+COMMIT="$(git rev-parse HEAD)"
+LOG_FILE="$LOG_DIR/agent-$COMMIT.log"
+
+# Skip recursive triggers: if the agent itself made a commit, don't loop.
+LAST_MSG="$(git log -1 --pretty=%B)"
+if [[ "$LAST_MSG" == *"[skip test-agent]"* ]]; then
+    echo "[post-commit] skipping (commit message contains [skip test-agent])"
+    exit 0
+fi
+
+echo "[post-commit] launching test-agent for $COMMIT — log: $LOG_FILE"
+
+# Fail fast if `claude` is not on PATH — the orchestrator needs it.
+if ! command -v claude >/dev/null 2>&1; then
+    echo "[post-commit] ERROR: \`claude\` CLI not found on PATH. Install Claude Code." >&2
+    exit 0   # never block the developer's commit; just skip the agent
+fi
+
+# Run detached. The orchestrator has its own 20-min wall-clock timeout
+# (overall_timeout_sec in config.yaml) so a runaway process self-terminates.
+nohup python -m agents.orchestrator \
+    --commit "$COMMIT" \
+    --repo "$REPO_ROOT" \
+    >"$LOG_FILE" 2>&1 &
+
+disown || true
+exit 0
