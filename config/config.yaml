@@ -12,6 +12,15 @@ max_subagents: 5           # ceiling on concurrent sub-agents (requirement #4)
 overall_timeout_sec: 5
 subagent_timeout_sec: 600  # per-sub-agent ceiling (safety)
 
+# Test-run + auto-fix loop.
+# After the initial generation, the orchestrator runs the test suite. If it
+# fails, it spawns fix sub-agents that read the failing test + its source
+# and patch the test only. The loop repeats until the suite is green or
+# until `max_fix_iterations` attempts have been used — whichever comes first.
+# After exhausting the budget, the run exits with a non-zero status and
+# logs MANUAL FIX REQUIRED.
+max_fix_iterations: 3
+
 # What counts as a "source file we should test"
 source_globs:
   - "src/main/java/**/*.java"

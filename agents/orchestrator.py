@@ -14,7 +14,12 @@ Pipeline:
     3. for each batch     -> spawn ONE `claude -p` subprocess (parallel)
        sub-agents return  -> JSON summary of created/updated/skipped tests
     4. test_runner        -> compile + run the test suite (mvn/gradle)
-    5. auto_commit        -> commit generated tests on green (tagged so the
+    5. fix loop           -> while the suite is red, spawn fix sub-agents that
+                             read the failing test + its source and patch the
+                             test (only). Capped at `max_fix_iterations`
+                             attempts; after that the run exits non-zero with
+                             MANUAL FIX REQUIRED.
+    6. auto_commit        -> commit generated tests on green (tagged so the
                              post-commit hook bails out and we don't loop)
 
 Hard guarantees (matching the user's requirements):
@@ -25,6 +30,7 @@ Hard guarantees (matching the user's requirements):
     * Max 5 parallel sub-agents.        (4)  asyncio.Semaphore + planner cap
     * Force-stop everything after 20m.  (5)  asyncio.wait_for + process kill
     * Tests appended with `Test`.       (6)  test_resolver
+    * Auto-fix capped at N attempts.    (NEW) max_fix_iterations in config.yaml
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from tools.batch_planner import plan as plan_batches       # noqa: E402
 from tools.test_resolver import resolve as resolve_test    # noqa: E402
 from tools import test_runner                              # noqa: E402
 from tools import auto_commit as auto_commit_tool          # noqa: E402
+from tools import failure_parser                           # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -58,6 +65,14 @@ from tools import auto_commit as auto_commit_tool          # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 CFG_PATH = ROOT / "config" / "config.yaml"
 SUBAGENT_PROMPT = (ROOT / "agents" / "subagent_prompt.md").read_text()
+FIX_SUBAGENT_PROMPT = (ROOT / "agents" / "fix_subagent_prompt.md").read_text()
+
+# Exit codes — surfaced to the post-commit hook log.
+EXIT_OK = 0
+EXIT_TESTS_FAILED = 2          # generation finished, suite still red, no fix loop ran
+EXIT_MANUAL_FIX_REQUIRED = 3   # fix loop exhausted max_fix_iterations without going green
+EXIT_OVERALL_TIMEOUT = 124
+EXIT_CLI_MISSING = 127
 
 
 def load_cfg() -> dict:
@@ -213,6 +228,206 @@ async def run_subagent(
 
 
 # --------------------------------------------------------------------------- #
+# Fix-mode sub-agent — runs after a red test suite                             #
+# --------------------------------------------------------------------------- #
+def _build_test_map(summaries: List[dict]) -> dict:
+    """{simple_test_class_name: {source, test}} from the generation summaries.
+
+    The fix loop uses this to find the source file that goes with each
+    failing test class. Tests the agent never generated/updated are absent
+    from the map and the fix loop refuses to touch them (likely a
+    pre-existing test broken by the source change — developer's call)."""
+    out: dict = {}
+    for s in summaries:
+        if isinstance(s, BaseException) or not isinstance(s, dict):
+            continue
+        parsed = s.get("parsed") or {}
+        for r in parsed.get("results", []) or []:
+            test_path = r.get("test") or ""
+            source_path = r.get("source") or ""
+            if not test_path:
+                continue
+            simple = Path(test_path).stem  # e.g. "OrderServiceTest"
+            out[simple] = {"source": source_path, "test": test_path}
+    return out
+
+
+async def run_fix_subagent(
+    iteration: int,
+    batch_id: int,
+    items: List[dict],
+    repo_root: str,
+    cfg: dict,
+    claude_bin: str,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """Spawn one `claude -p` subprocess to repair a batch of failing tests."""
+
+    async with semaphore:
+        _log(
+            f"fix sub-agent iter={iteration} batch={batch_id} "
+            f"({len(items)} failing test class(es))"
+        )
+
+        user_prompt = (
+            f"Fix attempt {iteration} of {cfg.get('max_fix_iterations', 3)}.\n"
+            "The tests below failed in the last build. For each entry, read "
+            "the test file and its source, diagnose the cause, and patch "
+            "ONLY the test file. Never modify any source under "
+            "`src/main/java/`. Preserve passing tests.\n\n"
+            f"```json\n{json.dumps(items, indent=2)}\n```\n\n"
+            "Return ONLY the JSON summary specified in your system prompt."
+        )
+
+        cmd = [
+            claude_bin,
+            "-p", user_prompt,
+            "--bare",
+            "--append-system-prompt", FIX_SUBAGENT_PROMPT,
+            "--allowedTools", "Read,Write,Edit,Glob,Grep",
+            "--permission-mode", "acceptEdits",
+            "--output-format", "json",
+            "--model", cfg["model"],
+        ]
+
+        per_subagent_timeout = int(cfg.get("subagent_timeout_sec", 600))
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=per_subagent_timeout
+            )
+        except asyncio.TimeoutError:
+            _log(
+                f"fix sub-agent iter={iteration} batch={batch_id} "
+                f"TIMEOUT after {per_subagent_timeout}s — killing process group"
+            )
+            _kill_process_group(proc.pid)
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return {
+                "iteration": iteration, "batch_id": batch_id,
+                "error": "subagent_timeout",
+                "tests_targeted": [it["test_class"] for it in items],
+            }
+        except asyncio.CancelledError:
+            _kill_process_group(proc.pid)
+            raise
+
+        stdout = stdout_b.decode("utf-8", "replace")
+        stderr = stderr_b.decode("utf-8", "replace")
+
+        summary: dict = {
+            "iteration": iteration,
+            "batch_id": batch_id,
+            "tests_targeted": [it["test_class"] for it in items],
+        }
+
+        if proc.returncode != 0:
+            _log(
+                f"fix sub-agent iter={iteration} batch={batch_id} "
+                f"FAILED (exit {proc.returncode})"
+            )
+            summary["error"] = "claude_cli_failed"
+            summary["exit_code"] = proc.returncode
+            summary["stderr_tail"] = stderr[-1500:]
+            return summary
+
+        _log(f"fix sub-agent iter={iteration} batch={batch_id} done")
+
+        try:
+            envelope = json.loads(stdout)
+            final_text = envelope.get("result", "")
+            summary["claude_meta"] = {
+                "total_cost_usd": envelope.get("total_cost_usd"),
+                "duration_ms": envelope.get("duration_ms"),
+                "num_turns": envelope.get("num_turns"),
+                "session_id": envelope.get("session_id"),
+            }
+        except json.JSONDecodeError:
+            final_text = stdout
+            summary["envelope_parse"] = "fallback_to_raw_stdout"
+
+        try:
+            start = final_text.find("{")
+            end = final_text.rfind("}")
+            if start != -1 and end != -1:
+                summary["parsed"] = json.loads(final_text[start : end + 1])
+            else:
+                summary["raw"] = final_text[-2000:]
+        except json.JSONDecodeError as e:
+            summary["parse_error"] = str(e)
+            summary["raw"] = final_text[-2000:]
+
+        return summary
+
+
+async def run_fix_iteration(
+    iteration: int,
+    failures: List[failure_parser.TestFailure],
+    test_map: dict,
+    repo_root: str,
+    cfg: dict,
+    claude_bin: str,
+) -> List[dict]:
+    """Build batches from failures and dispatch fix sub-agents in parallel."""
+
+    actionable: List[dict] = []
+    skipped: List[str] = []
+    for f in failures:
+        meta = test_map.get(f.test_class)
+        if not meta:
+            skipped.append(f.test_class)
+            continue
+        actionable.append({
+            "test_class": f.test_class,
+            "fq_test_class": f.fq_test_class,
+            "test_path": meta["test"],
+            "source_path": meta["source"],
+            "is_compile_error": f.is_compile_error,
+            "errors": f.error_messages,
+        })
+
+    if skipped:
+        _log(
+            f"iter={iteration}: skipping {len(skipped)} failing test(s) "
+            f"this run did not generate — pre-existing or unrelated: {skipped}"
+        )
+    if not actionable:
+        _log(f"iter={iteration}: nothing for the fix loop to do")
+        return []
+
+    bs = int(cfg["batch_size"])
+    cap = int(cfg["max_subagents"])
+    batches = [actionable[i : i + bs] for i in range(0, len(actionable), bs)]
+    if len(batches) > cap:
+        _log(
+            f"iter={iteration}: {len(batches)} fix batches exceeds cap {cap} — "
+            "truncating; remaining failures will be retried next iteration"
+        )
+        batches = batches[:cap]
+
+    sem = asyncio.Semaphore(min(len(batches), cap))
+    tasks = [
+        asyncio.create_task(
+            run_fix_subagent(iteration, i, batch, repo_root, cfg, claude_bin, sem),
+            name=f"fix-iter{iteration}-batch{i}",
+        )
+        for i, batch in enumerate(batches, start=1)
+    ]
+    return await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# --------------------------------------------------------------------------- #
 # Top-level run                                                                #
 # --------------------------------------------------------------------------- #
 async def run(commit: str, repo_root: str) -> int:
@@ -278,23 +493,97 @@ async def run(commit: str, repo_root: str) -> int:
         else:
             print(json.dumps(s, indent=2))
 
-    _log("running test suite to validate generated tests…")
-    remaining = max(60, overall_timeout - int(time.time() - t0))
-    result = test_runner.run(timeout_sec=remaining)
-    print("\n===== test runner =====")
-    print(json.dumps(asdict(result), indent=2))
+    # Map every test class this run produced -> the (source, test) pair, so
+    # the fix loop knows which file to patch and where to find the contract.
+    test_map = _build_test_map(
+        [s for s in summaries if isinstance(s, dict)]
+    )
 
-    if result.success and cfg.get("auto_commit_on_green", False):
+    # ------------------------------------------------------------------- #
+    # Test + auto-fix loop                                                 #
+    # ------------------------------------------------------------------- #
+    # attempt 0 = the initial run (no fixes yet).
+    # attempts 1..max_fix_iters = fix iterations, each followed by a re-run.
+    # After max_fix_iters fixes have not gone green, exit with
+    # EXIT_MANUAL_FIX_REQUIRED so the developer sees the prompt to step in.
+    max_fix_iters = int(cfg.get("max_fix_iterations", 3))
+
+    result = None
+    for attempt in range(max_fix_iters + 1):
+        label = "initial" if attempt == 0 else f"after fix {attempt}/{max_fix_iters}"
+        _log(f"running test suite ({label})…")
+        remaining = max(60, overall_timeout - int(time.time() - t0))
+        result = test_runner.run(timeout_sec=remaining)
+        print(f"\n===== test runner ({label}) =====")
+        print(json.dumps(asdict(result), indent=2))
+
+        if result.success:
+            if attempt > 0:
+                _log(f"tests green after {attempt} fix iteration(s)")
+            break
+
+        if attempt >= max_fix_iters:
+            _log(
+                f"ERROR: tests still failing after {max_fix_iters} fix "
+                "iteration(s) — MANUAL FIX REQUIRED. Review the test runner "
+                "output above and patch the failing tests yourself."
+            )
+            break
+
+        failures = failure_parser.parse(result.stdout_tail, result.stderr_tail)
+        if not failures:
+            _log(
+                "WARN: build is red but no failing test class could be "
+                "parsed from the runner output — aborting fix loop. "
+                "Check the test runner stdout/stderr above."
+            )
+            break
+
+        _log(
+            f"detected {len(failures)} failing test class(es): "
+            f"{[f.test_class for f in failures]}"
+        )
+
+        fix_summaries = await run_fix_iteration(
+            iteration=attempt + 1,
+            failures=failures,
+            test_map=test_map,
+            repo_root=repo_root,
+            cfg=cfg,
+            claude_bin=claude_bin,
+        )
+        print(f"\n===== fix iteration {attempt + 1} summaries =====")
+        for s in fix_summaries:
+            if isinstance(s, BaseException):
+                print(json.dumps({"error": str(s)}, indent=2))
+            else:
+                print(json.dumps(s, indent=2))
+
+        if not fix_summaries:
+            # run_fix_iteration logged the reason already (nothing actionable).
+            _log("no fix sub-agents ran — exiting fix loop")
+            break
+
+    # ------------------------------------------------------------------- #
+    # Final outcome                                                        #
+    # ------------------------------------------------------------------- #
+    if result and result.success and cfg.get("auto_commit_on_green", False):
         _log("tests green — auto-committing generated tests…")
         commit_res = auto_commit_tool.commit(repo_root)
         print("\n===== auto-commit =====")
         print(json.dumps(asdict(commit_res), indent=2))
-    elif not result.success:
-        _log("tests failed — NOT auto-committing. Review the generated tests manually.")
+    elif not (result and result.success):
+        _log(
+            "tests failed — NOT auto-committing. Review the generated tests "
+            "manually (see failures above)."
+        )
 
     elapsed = round(time.time() - t0, 1)
-    _log(f"done in {elapsed}s — tests {'PASSED' if result.success else 'FAILED'}")
-    return 0 if result.success else 2
+    passed = bool(result and result.success)
+    _log(f"done in {elapsed}s — tests {'PASSED' if passed else 'FAILED'}")
+    if passed:
+        return EXIT_OK
+    return EXIT_MANUAL_FIX_REQUIRED
 
 
 def main() -> int:
