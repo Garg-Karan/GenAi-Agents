@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import shlex
 import subprocess
 import sys
 import time
@@ -52,13 +51,19 @@ def _build_cmd(cfg: dict, classes: Optional[List[str]]) -> str:
     return base
 
 
-def run(classes: Optional[List[str]] = None, timeout_sec: int = 900) -> TestRunResult:
+def run(
+    classes: Optional[List[str]] = None,
+    timeout_sec: int = 900,
+    cwd: Optional[str] = None,
+) -> TestRunResult:
     cfg = _load_cfg()
     cmd = _build_cmd(cfg, classes)
     t0 = time.time()
     try:
         proc = subprocess.run(
-            shlex.split(cmd),
+            cmd,
+            shell=True,
+            cwd=cwd,
             check=False,
             capture_output=True,
             text=True,

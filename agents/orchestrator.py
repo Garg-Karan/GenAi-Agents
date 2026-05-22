@@ -135,19 +135,9 @@ async def run_subagent(
         )
 
         # Build the `claude -p` command line.
-        #
-        # --bare              : skip auto-discovery of plugins/MCP/skills/CLAUDE.md
-        #                       so a developer's local config can't change behavior.
-        # --append-system-prompt : inject our sub-agent rulebook.
-        # --allowedTools      : NO Bash, NO Agent => sub-agents cannot recurse
-        #                       (requirement #4) and cannot run arbitrary commands.
-        # --permission-mode acceptEdits : auto-accept Write/Edit without prompting.
-        # --output-format json : machine-parseable result envelope.
-        # --model             : pin the model from config.yaml.
         cmd = [
             claude_bin,
             "-p", user_prompt,
-            "--bare",
             "--append-system-prompt", SUBAGENT_PROMPT,
             "--allowedTools", "Read,Write,Edit,Glob,Grep",
             "--permission-mode", "acceptEdits",
@@ -191,6 +181,7 @@ async def run_subagent(
                 "batch_id": batch_id,
                 "error": "claude_cli_failed",
                 "exit_code": proc.returncode,
+                "stdout_tail": stdout[-1500:],
                 "stderr_tail": stderr[-1500:],
                 "files": files,
             }
@@ -282,7 +273,6 @@ async def run_fix_subagent(
         cmd = [
             claude_bin,
             "-p", user_prompt,
-            "--bare",
             "--append-system-prompt", FIX_SUBAGENT_PROMPT,
             "--allowedTools", "Read,Write,Edit,Glob,Grep",
             "--permission-mode", "acceptEdits",
@@ -339,6 +329,7 @@ async def run_fix_subagent(
             )
             summary["error"] = "claude_cli_failed"
             summary["exit_code"] = proc.returncode
+            summary["stdout_tail"] = stdout[-1500:]
             summary["stderr_tail"] = stderr[-1500:]
             return summary
 
@@ -513,7 +504,7 @@ async def run(commit: str, repo_root: str) -> int:
         label = "initial" if attempt == 0 else f"after fix {attempt}/{max_fix_iters}"
         _log(f"running test suite ({label})…")
         remaining = max(60, overall_timeout - int(time.time() - t0))
-        result = test_runner.run(timeout_sec=remaining)
+        result = test_runner.run(timeout_sec=remaining, cwd=repo_root)
         print(f"\n===== test runner ({label}) =====")
         print(json.dumps(asdict(result), indent=2))
 
