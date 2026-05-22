@@ -9,8 +9,20 @@ model: "claude-sonnet-4-6"
 # Hard limits
 batch_size: 4              # files per sub-agent (requirement #4)
 max_subagents: 5           # ceiling on concurrent sub-agents (requirement #4)
-overall_timeout_sec: 5
+overall_timeout_sec: 1200  # 20-min global kill switch (requirement #5)
 subagent_timeout_sec: 600  # per-sub-agent ceiling (safety)
+
+# After tests run, the orchestrator can re-spawn sub-agents to fix failing
+# tests it generated, then re-run. This caps how many fix passes it will
+# attempt before giving up and surfacing a "manual fix required" error.
+# Total runs = 1 generation + up to max_fix_iterations fix passes.
+max_fix_iterations: 3
+
+# Where the build tool writes JUnit-style XML reports. Used by the failure
+# parser to figure out which tests failed and why.
+#   Maven   -> target/surefire-reports
+#   Gradle  -> build/test-results/test
+test_report_dir: "target/surefire-reports"
 
 # What counts as a "source file we should test"
 source_globs:

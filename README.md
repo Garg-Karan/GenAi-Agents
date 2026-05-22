@@ -1,8 +1,9 @@
 # Spring Boot Test-Generation Agent
 
 A multi-agent system that, the moment a developer commits Java code, writes or
-updates JUnit 5 + Mockito tests for the changed source files. Built on the
-Claude Agent SDK with a Python orchestrator.
+updates JUnit 5 + Mockito tests for the changed source files, then **runs the
+tests and self-heals failures** up to a bounded number of attempts. Built on
+the Claude Agent SDK with a Python orchestrator.
 
 ## How the requirements map to the code
 
@@ -15,6 +16,7 @@ Claude Agent SDK with a Python orchestrator.
 | 5 | Force-stop everything after 20 min                                | `asyncio.wait_for(..., overall_timeout_sec)` + process-group kill |
 | 6 | Create `<Class>Test.java` if missing                              | `tools/test_resolver.py` |
 | 7 | Always run the required tools                                     | Orchestrator calls tools deterministically before/after the LLM |
+| 8 | **Run tests; if red, fix and re-run; stop after 3 iterations**    | `tools/failure_parser.py`, `agents/fix_subagent_prompt.md`, fix loop in `agents/orchestrator.py` |
 | — | Write → run → auto-commit on green                                | `tools/auto_commit.py`, guarded by `auto_commit_on_green` |
 
 ## Architecture
@@ -38,13 +40,30 @@ git commit
                                       ▼
                               test_runner (mvn test)
                                       │
-                                  green? ── no ──► stop, surface failures
+                                  green? ── yes ──► auto_commit (tagged [skip test-agent])
                                       │
-                                     yes
+                                      no
                                       │
                                       ▼
-                              auto_commit  (message tagged [skip test-agent]
-                                            so the hook bails on the next loop)
+                       failure_parser (Surefire XMLs + stdout for compile errors)
+                                      │
+                                      ▼
+                       up to 5 FIX `claude -p` subprocesses in parallel
+                       (read source + test + failure context, edit TEST only)
+                                      │
+                                      ▼
+                              test_runner (re-run)
+                                      │
+                                  green? ── yes ──► auto_commit
+                                      │
+                                      no, and iterations < max_fix_iterations (3)
+                                      │
+                                      └─► loop back to failure_parser
+                                      │
+                                  iterations exhausted
+                                      │
+                                      ▼
+                       exit 3 — "manual fix required" surfaced in the log
 ```
 
 ### How the sub-agents work
@@ -65,6 +84,47 @@ When the 20-minute global timeout fires, each task's `CancelledError` handler
 calls `os.killpg(...)` on the subprocess's process group, killing `claude`
 and anything it spawned. This is the part the SDK version got "for free" —
 in the CLI version we have to do it explicitly.
+
+### The fix loop
+
+After the initial test run, if the suite is red the orchestrator enters a
+bounded self-heal loop:
+
+1. `tools/failure_parser.py` reads `target/surefire-reports/TEST-*.xml`
+   (configurable via `test_report_dir`) and extracts failures. If no XML
+   reports exist — usually because the generated test didn't compile — it
+   falls back to scanning the test runner's stdout for Maven's
+   `[ERROR] /path/Foo.java:[line,col] msg` lines.
+2. The orchestrator keeps a `set` of test paths the generation phase
+   actually created or updated. **Only failures in those files** are
+   eligible for auto-fix. If failures exist outside that set, the
+   orchestrator stops with exit code 3 and a "manual fix required"
+   message — it will not touch pre-existing tests.
+3. Failures are grouped by test file and chunked into batches of ≤4 files,
+   capped at 5 fix sub-agents. Each fix sub-agent receives the source path,
+   the test path, and the per-method failure context (type, message,
+   truncated stack trace).
+4. Fix sub-agents use `agents/fix_subagent_prompt.md`. Hard constraints:
+   they may only edit files under `src/test/java`; they must read the
+   source to verify signatures; they cannot disable a test, delete it, or
+   loosen its assertions to nothing.
+5. After fixes are written, the test runner re-runs. If green, auto-commit.
+   If still red and the iteration counter is below `max_fix_iterations`
+   (default 3), the loop repeats. Otherwise exit 3.
+
+The 20-minute global kill switch wraps everything — generation, every fix
+iteration, and every test run — so the worst case is a clean abort with
+exit 124, never a runaway agent.
+
+### Exit codes
+
+| Code | Meaning                                                             |
+|------|---------------------------------------------------------------------|
+| 0    | All tests green (possibly after one or more fix iterations)         |
+| 3    | Tests still failing — manual fix required (iterations exhausted, or failures are outside agent-generated tests) |
+| 124  | Overall 20-minute timeout fired                                     |
+| 127  | `claude` CLI not on PATH                                            |
+| 130  | KeyboardInterrupt                                                   |
 
 ### Loop prevention
 
