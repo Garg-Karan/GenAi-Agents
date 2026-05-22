@@ -9,7 +9,7 @@ model: "claude-sonnet-4-6"
 # Hard limits
 batch_size: 4              # files per sub-agent (requirement #4)
 max_subagents: 5           # ceiling on concurrent sub-agents (requirement #4)
-overall_timeout_sec: 5
+overall_timeout_sec: 1200
 subagent_timeout_sec: 600  # per-sub-agent ceiling (safety)
 
 # Test-run + auto-fix loop.
