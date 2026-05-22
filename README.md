@@ -153,5 +153,5 @@ to switch between Maven and Gradle, or to change the JUnit/Mockito stance.
   coverage gate can be layered on top in CI without touching this agent.
 * **Spring-context test detection.** Controllers get `@WebMvcTest`,
   services get plain Mockito. Anything more elaborate (e.g.
-  `@DataJpaTest`, Testcontainers) is left to the sub-agent's judgment of
+  `@DataJpaTest`, Testcontainers) is left to the sub-agent's judgement of
   the source code.
