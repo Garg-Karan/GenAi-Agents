@@ -1,0 +1,48 @@
+# Spring Boot Test-Generation Agent — Configuration
+
+# Model used by every sub-agent. Sonnet 4.6 is the sweet spot for Spring test
+# generation: strong at multi-file Java context and Mockito wiring, ~5x cheaper
+# and faster than Opus, and meaningfully more reliable than Haiku on JUnit code
+# that must compile and pass.
+model: "claude-sonnet-4-6"
+
+# Hard limits
+batch_size: 4              # files per sub-agent (requirement #4)
+max_subagents: 5           # ceiling on concurrent sub-agents (requirement #4)
+overall_timeout_sec: 5
+subagent_timeout_sec: 600  # per-sub-agent ceiling (safety)
+
+# What counts as a "source file we should test"
+source_globs:
+  - "src/main/java/**/*.java"
+
+# What we never test (these *are* tests, configs, DTOs without logic, etc.)
+ignore_patterns:
+  - "**/package-info.java"
+  - "**/*Application.java"      # Spring Boot bootstrap class
+  - "**/dto/**"                 # plain DTOs — usually no logic worth testing
+  - "**/entity/**"              # JPA entities — same
+  - "**/config/**"              # @Configuration classes
+
+# Test layout
+test_root: "src/test/java"
+test_suffix: "Test"             # MyService -> MyServiceTest  (requirement #6)
+
+# Frameworks (requirement #3)
+test_framework: "junit5"
+mocking_framework: "mockito"
+
+# Build tool — used to compile + run the generated tests
+build_tool: "maven"             # or "gradle"
+build_test_cmd: "mvn -q -DskipITs test"
+
+# Auto-commit generated tests when the test runner is green.
+# The commit message includes [skip test-agent] so the post-commit hook
+# won't recursively trigger another agent run on this commit.
+auto_commit_on_green: true
+auto_commit_author_name: "test-agent"
+auto_commit_author_email: "test-agent@local"
+auto_commit_message: "test: auto-generated JUnit tests [skip test-agent]"
+
+# Logging
+log_dir: ".test-agent/logs"
